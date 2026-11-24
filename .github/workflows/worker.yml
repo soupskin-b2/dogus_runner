@@ -1,0 +1,86 @@
+# Starts a GitHub-hosted machine that registers as a single-use runner for the
+# private source repo, runs one queued job there, then exits. The controller
+# writes the runner credentials into the DISPATCH secret and bumps
+# .trigger/dispatch, which starts this workflow. Job steps and their logs belong
+# to the source repo; nothing from it is kept here.
+name: worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".trigger/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          DISPATCH: ${{ secrets.DISPATCH }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DISPATCH:-}" ]] || ! count=$(jq 'length' <<<"$DISPATCH" 2>/dev/null); then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "No dispatch payload; nothing to do." >&2
+            exit 0
+          fi
+          # Only shape goes into the matrix. The credentials stay in the secret.
+          matrix=$(jq -c '[to_entries[] | {idx: .key, os: .value.os, v: .value.v}]' <<<"$DISPATCH")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  worker:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Load credentials
+        shell: bash
+        env:
+          DISPATCH: ${{ secrets.DISPATCH }}
+          IDX: ${{ matrix.idx }}
+        run: |
+          set -euo pipefail
+          jit=$(jq -r --argjson i "$IDX" '.[$i].jit' <<<"$DISPATCH")
+          if [[ -z "$jit" || "$jit" == "null" ]]; then
+            echo "No credentials for this slot; skipping." >&2
+            exit 1
+          fi
+          echo "::add-mask::$jit"
+          echo "RUNNER_JIT=$jit" >> "$GITHUB_ENV"
+
+      - name: Run one job
+        shell: bash
+        env:
+          RUNNER_VERSION: ${{ matrix.v }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/runner"
+          mkdir -p "$work" && cd "$work"
+          curl -fsSL -o runner.tar.gz "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+          tar xzf runner.tar.gz && rm -f runner.tar.gz
+          ./run.sh --jitconfig "$RUNNER_JIT"
+
+      - name: Clean up
+        if: always()
+        shell: bash
+        run: |
+          # the source checkout, build output, Go caches and the runner itself
+          rm -rf "$RUNNER_TEMP/runner" "$HOME/go" "$HOME/.cache/go-build" "$HOME/.ssh/deploy_key" 2>/dev/null || true
+          echo "cleaned"
